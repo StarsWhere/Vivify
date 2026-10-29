@@ -270,3 +270,6 @@ __pycache__/
 /UserData/
 /Plugins/
 /Libs/
+
+# Preserve shader source import settings
+!/ShaderBuild/Assets/**/*.meta
