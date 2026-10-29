@@ -9,9 +9,10 @@ namespace Vivify;
 [UsedImplicitly(ImplicitUseTargetFlags.Members)]
 public class Config
 {
-    public int MaxCamera2Cams { get; set; } = 2;
+    // BSIPA's generated store observes virtual setters to persist changes.
+    public virtual int MaxCamera2Cams { get; set; } = 2;
 
-    public bool AllowDownload { get; set; }
+    public virtual bool AllowDownload { get; set; }
 
-    public string BundleRepository { get; set; } = "https://repo.totalbs.dev/api/v1/bundles/";
+    public virtual string BundleRepository { get; set; } = "https://repo.totalbs.dev/api/v1/bundles/";
 }
