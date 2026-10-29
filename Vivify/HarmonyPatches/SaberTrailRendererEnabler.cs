@@ -8,15 +8,15 @@ namespace Vivify.HarmonyPatches;
 internal static class SaberTrailRendererEnabler
 {
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(SaberTrailRenderer), nameof(SaberTrailRenderer.OnEnable))]
-    [HarmonyPatch(typeof(SaberTrailRenderer), nameof(SaberTrailRenderer.OnDisable))]
+    [HarmonyPatch(typeof(SaberTrailRenderer), "OnEnable")]
+    [HarmonyPatch(typeof(SaberTrailRenderer), "OnDisable")]
     private static bool DisableDisable()
     {
         return false;
     }
 
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(SaberTrail), nameof(SaberTrail.OnDisable))]
+    [HarmonyPatch(typeof(SaberTrail), "OnDisable")]
     private static bool DisableFix(
         SaberTrailRenderer ____trailRenderer)
     {
@@ -29,7 +29,7 @@ internal static class SaberTrailRendererEnabler
     }
 
     [HarmonyPrefix]
-    [HarmonyPatch(typeof(SaberTrail), nameof(SaberTrail.OnEnable))]
+    [HarmonyPatch(typeof(SaberTrail), "OnEnable")]
     private static bool EnableFix(
         SaberTrail __instance,
         bool ____inited,

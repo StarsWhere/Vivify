@@ -7,6 +7,7 @@ using JetBrains.Annotations;
 using SiraUtil.Logging;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Rendering.Universal;
 using Zenject;
 using static Vivify.VivifyController;
 
@@ -20,7 +21,6 @@ internal class PostProcessingController : CullingCameraController
     private readonly Dictionary<string, CullingCameraController> _cullingCameraControllers = new();
     private readonly Dictionary<string, RenderTextureHolder> _declaredTextures = new();
     private readonly Stack<SecondaryCameraController> _disabledCullingCameraControllers = new();
-    private readonly Stack<ActiveCommandBuffer> _activeCommandBuffers = new();
 
     private readonly List<CreateCameraData> _reusableCameraKeys = [];
     private readonly List<CreateScreenTextureData> _reusableDeclaredKeys = [];
@@ -30,8 +30,15 @@ internal class PostProcessingController : CullingCameraController
     private SiraLog _log = null!;
     private IInstantiator _instantiator = null!;
 
-    private ImageEffectController _imageEffectController = null!;
     private RenderTextureDescriptor? _cachedMainDescriptor;
+    private RenderTexture? _resolvedInput;
+
+    internal Camera.MonoOrStereoscopicEye RenderEye { get; private set; }
+    internal long RenderPassCount { get; private set; }
+    internal long MaterialBlitCount { get; private set; }
+    internal string[] GrabTextures { get; set; } = Array.Empty<string>();
+
+    internal bool HasWork => GrabTextures.Length > 0 || CameraDatas.Count > 0 || DeclaredTextureDatas.Count > 0 || Effects.Values.Any(list => list.Count > 0);
 
     internal Dictionary<string, CreateCameraData> CameraDatas { get; set; } = new();
 
@@ -135,137 +142,90 @@ internal class PostProcessingController : CullingCameraController
         base.OnPreCull();
     }
 
-    protected override void OnPostRender()
+    internal void RenderUrp(CommandBuffer command, RenderTextureDescriptor descriptor,
+        RenderTargetIdentifier target, PostProcessingOrder order, RenderTexture? sourceTexture)
     {
-        ClearActiveCommandBuffers();
-
-        base.OnPostRender();
-    }
-
-    // Cool method for copying serialized fields
-    // if i was smart, i would've used this for chroma components
-    private static void CopyComponent<T, TDerived>(T original, GameObject destination)
-        where T : MonoBehaviour
-        where TDerived : T
-    {
-        Type type = typeof(T);
-        MonoBehaviour copy = destination.AddComponent<TDerived>();
-        FieldInfo[] fields = type.GetFields(BindingFlags.NonPublic | BindingFlags.Instance);
-        foreach (FieldInfo field in fields)
-        {
-            if (Attribute.IsDefined(field, typeof(SerializeField)))
-            {
-                field.SetValue(copy, field.GetValue(original));
-            }
-        }
-    }
-
-    private void OnRenderImage(RenderTexture src, RenderTexture dst)
-    {
-        RenderTextureDescriptor descriptor = src.descriptor;
+        RenderPassCount++;
+        int sourceSamples = descriptor.msaaSamples;
+        descriptor.depthBufferBits = 0;
+        descriptor.depthStencilFormat = UnityEngine.Experimental.Rendering.GraphicsFormat.None;
         descriptor.msaaSamples = 1;
+        descriptor.bindMS = false;
         _cachedMainDescriptor = descriptor;
-        CreateDeclaredTextures(descriptor);
-        RenderTexture temp = RenderTexture.GetTemporary(descriptor);
-        Graphics.ExecuteCommandBuffer(RenderImage(descriptor, src, temp, Effects[PostProcessingOrder.BeforeMainEffect]));
-
-        ImageEffectController.RenderImageCallback? callback = _imageEffectController._renderImageCallback;
-        if (callback != null && _imageEffectController.isActiveAndEnabled)
+        bool stereoArray = descriptor.dimension == TextureDimension.Tex2DArray;
+        int eyes = stereoArray ? descriptor.volumeDepth : 1;
+        bool instancing = Shader.IsKeywordEnabled("STEREO_INSTANCING_ON");
+        bool multiview = Shader.IsKeywordEnabled("STEREO_MULTIVIEW_ON");
+        bool singlePass = Shader.IsKeywordEnabled("UNITY_SINGLE_PASS_STEREO");
+        bool multipass = Shader.IsKeywordEnabled("MULTIPASS_ENABLED");
+        int previousEye = Shader.GetGlobalInt("_StereoActiveEye");
+        RenderTargetIdentifier inputTarget = target;
+        if (sourceSamples > 1)
         {
-            RenderTexture temp2 = RenderTexture.GetTemporary(descriptor);
-            callback(temp, temp2);
-            RenderTexture.ReleaseTemporary(temp);
-            temp = temp2;
+            if (sourceTexture == null) throw new InvalidOperationException("Multisampled Vivify input has no render texture.");
+            if (_resolvedInput == null || _resolvedInput.descriptor.width != descriptor.width || _resolvedInput.descriptor.height != descriptor.height || _resolvedInput.descriptor.dimension != descriptor.dimension || _resolvedInput.descriptor.volumeDepth != descriptor.volumeDepth || _resolvedInput.graphicsFormat != descriptor.graphicsFormat)
+            {
+                if (_resolvedInput != null) { _resolvedInput.Release(); Destroy(_resolvedInput); }
+                _resolvedInput = new RenderTexture(descriptor) { name = "Vivify resolved camera input" }; _resolvedInput.Create();
+            }
+            command.ResolveAntiAliasedSurface(sourceTexture, _resolvedInput);
+            inputTarget = new RenderTargetIdentifier(_resolvedInput);
         }
-
-        Graphics.ExecuteCommandBuffer(RenderImage(descriptor, temp, dst, Effects[PostProcessingOrder.AfterMainEffect]));
-        RenderTexture.ReleaseTemporary(temp);
+        if (stereoArray)
+        {
+            command.DisableShaderKeyword("STEREO_INSTANCING_ON");
+            command.DisableShaderKeyword("STEREO_MULTIVIEW_ON");
+            command.DisableShaderKeyword("UNITY_SINGLE_PASS_STEREO");
+            command.EnableShaderKeyword("MULTIPASS_ENABLED");
+        }
+        for (int eye = 0; eye < eyes; eye++)
+        {
+            RenderEye = stereoArray ? (Camera.MonoOrStereoscopicEye)eye : Camera.stereoActiveEye;
+            command.SetGlobalInt("_StereoActiveEye", (int)RenderEye);
+            RenderTextureDescriptor mono = descriptor;
+            mono.dimension = TextureDimension.Tex2D; mono.volumeDepth = 1; mono.vrUsage = VRTextureUsage.None;
+            CreateDeclaredTextures(mono);
+            foreach (var holder in _declaredTextures.Values)
+                if (holder.Textures.TryGetValue(RenderEye, out var texture)) command.SetGlobalTexture(holder.Data.PropertyId, texture);
+            foreach (var controller in _cullingCameraControllers.Values)
+            {
+                if (controller is not SecondaryCameraController secondary) continue;
+                if (secondary.Key.HasValue && secondary.RenderTextures.TryGetValue(RenderEye, out var color)) command.SetGlobalTexture(secondary.Key.Value, color);
+                if (secondary.DepthKey.HasValue && secondary.RenderTexturesDepth.TryGetValue(RenderEye, out var depth)) command.SetGlobalTexture(secondary.DepthKey.Value, depth);
+            }
+            if (stereoArray)
+            {
+                int input = Shader.PropertyToID("_VivifyEyeInput");
+                int output = Shader.PropertyToID("_VivifyEyeOutput");
+                command.GetTemporaryRT(input, mono); command.GetTemporaryRT(output, mono);
+                command.CopyTexture(inputTarget, eye, 0, new RenderTargetIdentifier(input), 0, 0);
+                RenderImage(command, mono, input, output, Effects[order]);
+                command.SetRenderTarget(target, 0, CubemapFace.Unknown, eye);
+                Blitter.BlitTexture(command, new RenderTargetIdentifier(output), new Vector4(1, 1, 0, 0), Blitter.GetBlitMaterial(TextureDimension.Tex2D), 0);
+                command.ReleaseTemporaryRT(input); command.ReleaseTemporaryRT(output);
+            }
+            else RenderImage(command, mono, inputTarget, target, Effects[order]);
+        }
+        if (stereoArray)
+        {
+            Restore("STEREO_INSTANCING_ON", instancing); Restore("STEREO_MULTIVIEW_ON", multiview);
+            Restore("UNITY_SINGLE_PASS_STEREO", singlePass); Restore("MULTIPASS_ENABLED", multipass);
+        }
+        RenderEye = Camera.MonoOrStereoscopicEye.Mono;
+        command.SetGlobalInt("_StereoActiveEye", previousEye);
+        void Restore(string keyword, bool enabled) { if (enabled) command.EnableShaderKeyword(keyword); else command.DisableShaderKeyword(keyword); }
     }
 
-    private void OnPreRender()
+    protected override void OnBeforeUrpRendering()
     {
-        Camera.MonoOrStereoscopicEye stereoActiveEye = Camera.stereoActiveEye;
-
-        foreach (CullingCameraController controller in _cullingCameraControllers.Values)
-        {
-            if (controller is not SecondaryCameraController secondaryCameraController)
-            {
-                continue;
-            }
-
-            Camera camera = secondaryCameraController.Camera;
-            if (!camera.enabled)
-            {
-                camera.Render();
-            }
-
-            if (secondaryCameraController.Key != null &&
-                secondaryCameraController.RenderTextures.TryGetValue(
-                    stereoActiveEye,
-                    out RenderTexture colorTexture))
-            {
-                Shader.SetGlobalTexture(secondaryCameraController.Key.Value, colorTexture);
-            }
-
-            if (secondaryCameraController.DepthKey != null &&
-                secondaryCameraController.RenderTexturesDepth.TryGetValue(
-                    stereoActiveEye,
-                    out RenderTexture depthTexture))
-            {
-                Shader.SetGlobalTexture(secondaryCameraController.DepthKey.Value, depthTexture);
-            }
-        }
-
-        // set declared texture properties
-        foreach (RenderTextureHolder value in _declaredTextures.Values)
-        {
-            CreateScreenTextureData data = value.Data;
-            if (value.Textures.TryGetValue(stereoActiveEye, out RenderTexture texture))
-            {
-                Shader.SetGlobalTexture(data.PropertyId, texture);
-            }
-        }
-
-        if (!_cachedMainDescriptor.HasValue)
-        {
-            return;
-        }
-
-        CreateDeclaredTextures(_cachedMainDescriptor.Value);
-
-        RenderTargetIdentifier src = new(BuiltinRenderTextureType.CurrentActive);
-        RenderTargetIdentifier dst = new(BuiltinRenderTextureType.CameraTarget);
-
-        AddCommandBuffer(PostProcessingOrder.BeforeSkybox, CameraEvent.BeforeSkybox);
-        AddCommandBuffer(PostProcessingOrder.AfterSkybox, CameraEvent.AfterSkybox);
-        AddCommandBuffer(PostProcessingOrder.BeforeOpaque, CameraEvent.BeforeForwardOpaque);
-        AddCommandBuffer(PostProcessingOrder.AfterOpaque, CameraEvent.AfterForwardOpaque);
-        AddCommandBuffer(PostProcessingOrder.BeforeAlpha, CameraEvent.BeforeForwardAlpha);
-        AddCommandBuffer(PostProcessingOrder.AfterAlpha, CameraEvent.AfterForwardAlpha);
-        return;
-
-        void AddCommandBuffer(PostProcessingOrder order, CameraEvent cameraEvent)
-        {
-            List<MaterialData> materials = Effects[order];
-
-            if (materials.Count == 0)
-            {
-                return;
-            }
-
-            CommandBuffer command = RenderImage(_cachedMainDescriptor.Value, src, dst, materials);
-            Camera.AddCommandBuffer(cameraEvent, command);
-            _activeCommandBuffers.Push(new ActiveCommandBuffer
-            {
-                CameraEvent = cameraEvent,
-                Command = command
-            });
-        }
+        if (!HasWork) return;
+        foreach (var controller in _cullingCameraControllers.Values)
+            if (controller is SecondaryCameraController secondary) secondary.RenderForParent();
     }
 
     private void CreateDeclaredTextures(RenderTextureDescriptor descriptor)
     {
-        Camera.MonoOrStereoscopicEye stereoActiveEye = Camera.stereoActiveEye;
+        Camera.MonoOrStereoscopicEye stereoActiveEye = RenderEye;
 
         // set up declared textures
         foreach ((string textureName, RenderTextureHolder value) in _declaredTextures)
@@ -299,15 +259,14 @@ internal class PostProcessingController : CullingCameraController
         }
     }
 
-    private CommandBuffer RenderImage(RenderTextureDescriptor mainDescriptor, RenderTargetIdentifier src, RenderTargetIdentifier dst, List<MaterialData> materials)
+    private void RenderImage(CommandBuffer command, RenderTextureDescriptor mainDescriptor, RenderTargetIdentifier src, RenderTargetIdentifier dst, List<MaterialData> materials)
     {
-        Camera.MonoOrStereoscopicEye stereoActiveEye = Camera.stereoActiveEye;
-        CommandBuffer command = new();
+        Camera.MonoOrStereoscopicEye stereoActiveEye = RenderEye;
 
         if (materials.Count == 0)
         {
-            command.Blit(src, dst);
-            return command;
+            if (!src.Equals(dst)) command.Blit(src, dst);
+            return;
         }
 
         int tempIDNext = 69;
@@ -344,6 +303,7 @@ internal class PostProcessingController : CullingCameraController
                         RenderTargetIdentifier temp = new(tempID);
                         command.GetTemporaryRT(tempID, mainDescriptor);
                         command.Blit(main, temp, material, materialData.Pass);
+                        MaterialBlitCount++;
                         command.ReleaseTemporaryRT(mainID);
                         main = temp;
                         mainID = tempID;
@@ -386,6 +346,7 @@ internal class PostProcessingController : CullingCameraController
                             RenderTargetIdentifier temp = new(tempID);
                             command.GetTemporaryRT(tempID, source!.descriptor, source.filterMode);
                             command.Blit(source, temp, material, materialData.Pass);
+                            MaterialBlitCount++;
                             command.Blit(temp, source);
                             command.ReleaseTemporaryRT(tempID);
 
@@ -443,6 +404,7 @@ internal class PostProcessingController : CullingCameraController
                 if (blitMat != null)
                 {
                     command.Blit(blitSrc.Value, blitDst.Value, blitMat, blitPass);
+                    MaterialBlitCount++;
                 }
                 else
                 {
@@ -453,7 +415,7 @@ internal class PostProcessingController : CullingCameraController
 
         command.Blit(main, dst);
         command.ReleaseTemporaryRT(mainID);
-        return command;
+
     }
 
     private SecondaryCameraController CreateCamera()
@@ -462,20 +424,15 @@ internal class PostProcessingController : CullingCameraController
         ////newObject.SetActive(false);
         newObject.transform.SetParent(transform, false);
         newObject.AddComponent<Camera>();
-        CopyComponent<BloomPrePass, LateBloomPrePass>(gameObject.GetComponent<BloomPrePass>(), newObject);
+        MainEffectController parentEffect = GetComponent<MainEffectController>();
+        MainEffectController effect = newObject.AddComponent<MainEffectController>();
+        effect._mainEffectContainer = parentEffect._mainEffectContainer;
+        effect._fadeValue = parentEffect._fadeValue;
+        var data = newObject.AddComponent<UniversalAdditionalCameraData>();
+        data.allowXRRendering = false; data.requiresDepthTexture = true;
         SecondaryCameraController result =
             _instantiator.InstantiateComponent<SecondaryCameraController>(newObject, [this]);
         return result;
-    }
-
-    private void ClearActiveCommandBuffers()
-    {
-        while (_activeCommandBuffers.Count > 0)
-        {
-            ActiveCommandBuffer cmd = _activeCommandBuffers.Pop();
-            Camera.RemoveCommandBuffer(cmd.CameraEvent, cmd.Command);
-            cmd.Command.Dispose();
-        }
     }
 
     [UsedImplicitly]
@@ -488,7 +445,6 @@ internal class PostProcessingController : CullingCameraController
 
     private void Awake()
     {
-        _imageEffectController = GetComponent<ImageEffectController>();
 
         foreach (PostProcessingOrder key in Enum.GetValues(typeof(PostProcessingOrder)))
         {
@@ -499,8 +455,10 @@ internal class PostProcessingController : CullingCameraController
         }
     }
 
-    private void OnDestroy()
+    protected override void OnDestroy()
     {
+        base.OnDestroy();
+        if (_resolvedInput != null) { _resolvedInput.Release(); Destroy(_resolvedInput); }
         foreach (RenderTexture texture in _declaredTextures.Values.SelectMany(n => n.Textures.Values))
         {
             if (texture != null)
@@ -522,14 +480,6 @@ internal class PostProcessingController : CullingCameraController
 
         _cullingCameraControllers.Clear();
         _disabledCullingCameraControllers.Clear();
-        ClearActiveCommandBuffers();
-    }
-
-    private struct ActiveCommandBuffer
-    {
-        public CommandBuffer Command { get; set; }
-
-        public CameraEvent CameraEvent { get; set; }
     }
 }
 

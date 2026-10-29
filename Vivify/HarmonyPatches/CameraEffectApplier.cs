@@ -7,23 +7,29 @@ using JetBrains.Annotations;
 using SiraUtil.Affinity;
 using UnityEngine;
 using Vivify.PostProcessing;
+using Vivify.Managers;
 using Zenject;
 
 namespace Vivify.HarmonyPatches;
 
-internal class CameraEffectApplier : IAffinity, IDisposable
+internal class CameraEffectApplier : IInitializable, IDisposable
 {
     private readonly Dictionary<MainEffectController, PostProcessingController> _postProcessingControllers = new();
 
     private readonly ReLoader? _reLoader;
     private readonly int _prewarmCount;
+    private readonly string[] _grabTextures;
+    internal AssetBundleCompatibility.GrabShader[] GrabShaders { get; }
 
     [UsedImplicitly]
     private CameraEffectApplier(
         IReadonlyBeatmapData beatmapData,
+        AssetBundleManager assetBundleManager,
         [InjectOptional] ReLoader? reLoader)
     {
         _reLoader = reLoader;
+        _grabTextures = assetBundleManager.GrabTextures;
+        GrabShaders = assetBundleManager.GrabShaders;
         if (reLoader != null)
         {
             reLoader.Rewinded += OnRewind;
@@ -50,8 +56,15 @@ internal class CameraEffectApplier : IAffinity, IDisposable
 
     internal Dictionary<PostProcessingOrder, List<MaterialData>> Effects { get; } = new();
 
+    internal static CameraEffectApplier? Active { get; private set; }
+
+    public void Initialize() { Active = this; }
+
     public void Dispose()
     {
+        if (ReferenceEquals(Active, this)) Active = null;
+        foreach(var renderer in Resources.FindObjectsOfTypeAll<LegacyGrabRenderer>())UnityEngine.Object.Destroy(renderer);
+        _postProcessingControllers.Clear();
         Reset();
 
         if (_reLoader != null)
@@ -76,25 +89,15 @@ internal class CameraEffectApplier : IAffinity, IDisposable
         }
     }
 
-    [AffinityPrefix]
-    [AffinityPatch(typeof(MainEffectController), nameof(MainEffectController.OnPreRender))]
-    private void ApplyVivifyEffect(MainEffectController __instance)
+    internal void ConfigureController(PostProcessingController controller)
     {
-        if (_postProcessingControllers.TryGetValue(__instance, out PostProcessingController? postProcessingController))
-        {
-            return;
-        }
-
-        postProcessingController = __instance.GetComponent<PostProcessingController?>();
-        if (postProcessingController == null)
-        {
-            return;
-        }
-
-        _postProcessingControllers[__instance] = postProcessingController;
-        postProcessingController.CameraDatas = CameraDatas;
-        postProcessingController.DeclaredTextureDatas = DeclaredTextureDatas;
-        postProcessingController.Effects = Effects;
-        postProcessingController.PrewarmCameras(_prewarmCount);
+        var main = controller.GetComponent<MainEffectController>();
+        if (_postProcessingControllers.ContainsKey(main)) return;
+        _postProcessingControllers[main] = controller;
+        controller.CameraDatas = CameraDatas;
+        controller.DeclaredTextureDatas = DeclaredTextureDatas;
+        controller.Effects = Effects;
+        controller.GrabTextures = _grabTextures;
+        controller.PrewarmCameras(_prewarmCount);
     }
 }

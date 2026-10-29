@@ -1,5 +1,6 @@
 ﻿using System.Collections.Generic;
 using UnityEngine;
+using UnityEngine.Rendering;
 using Vivify.TrackGameObject;
 using static Vivify.VivifyController;
 
@@ -18,6 +19,30 @@ internal class CullingCameraController : MonoBehaviour
     internal Camera Camera => _camera ??= GetComponent<Camera>();
 
     internal CullingTextureTracker? CullingTextureData { get; set; }
+
+    protected virtual void OnEnable()
+    {
+        RenderPipelineManager.beginCameraRendering += BeginCamera;
+        RenderPipelineManager.endCameraRendering += EndCamera;
+    }
+    protected virtual void OnDisable()
+    {
+        RenderPipelineManager.beginCameraRendering -= BeginCamera;
+        RenderPipelineManager.endCameraRendering -= EndCamera;
+        OnPostRender();
+    }
+    protected virtual void OnDestroy() { OnDisable(); }
+    protected virtual void OnBeforeUrpRendering() { }
+    private void BeginCamera(ScriptableRenderContext context, Camera camera)
+    {
+        if (camera != Camera || !isActiveAndEnabled) return;
+        try { OnPreCull(); OnBeforeUrpRendering(); }
+        catch { OnPostRender(); throw; }
+    }
+    private void EndCamera(ScriptableRenderContext context, Camera camera)
+    {
+        if (camera == Camera) OnPostRender();
+    }
 
     protected virtual void OnPreCull()
     {

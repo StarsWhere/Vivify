@@ -21,19 +21,16 @@
     <DependsOn Include="CustomJSONData" Version="^2.6.3"/>
     <DependsOn Include="Heck" Version="^1.7.2"/>
     <DependsOn Include="SiraUtil" Version="^3.0.5"/>
-    <DependsOn Include="CameraUtils" Version="^1.0.3"/>
   </ItemGroup>
 
   <Choose>
     <When Condition="$(Configuration.EndsWith('1.29.1'))">
       <ItemGroup>
-        <EmbeddedResource Include="Resources\DepthBlit2019" LogicalName="Vivify.Resources.DepthBlit" />
       </ItemGroup>
     </When>
     <Otherwise>
       <ItemGroup>
         <DependsOn Include="AssetBundleLoadingTools" Version="^1.0.0"/>
-        <EmbeddedResource Include="Resources\DepthBlit2021" LogicalName="Vivify.Resources.DepthBlit" />
       </ItemGroup>
     </Otherwise>
   </Choose>

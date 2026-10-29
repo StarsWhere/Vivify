@@ -18,8 +18,8 @@ internal class VivifyAppInstaller : Installer
     public override void InstallBindings()
     {
         Container.BindInstance(_config);
-        Container.BindInterfacesAndSelfTo<DepthShaderManager>().AsSingle();
         Container.BindInterfacesTo<AddComponentsToCamera>().AsSingle();
+        Container.BindInterfacesTo<OrderedGrabPass>().AsSingle();
         Container.BindInterfacesAndSelfTo<FeaturesModule>().AsSingle();
     }
 }
