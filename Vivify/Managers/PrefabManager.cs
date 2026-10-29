@@ -7,6 +7,7 @@ using IPA.Utilities;
 using JetBrains.Annotations;
 using SiraUtil.Logging;
 using UnityEngine;
+using Vivify.PostProcessing;
 using Zenject;
 using Object = UnityEngine.Object;
 
@@ -39,6 +40,14 @@ internal class PrefabManager : IDisposable
 
     internal void Add(string id, GameObject prefab, List<Track>? track)
     {
+        foreach (Camera camera in prefab.GetComponentsInChildren<Camera>(true))
+            if (camera.targetTexture != null && (camera.targetTexture.graphicsFormat == UnityEngine.Experimental.Rendering.GraphicsFormat.None ||
+                UnityEngine.Experimental.Rendering.GraphicsFormatUtility.IsDepthFormat(camera.targetTexture.graphicsFormat)) &&
+                camera.targetTexture.depthStencilFormat != UnityEngine.Experimental.Rendering.GraphicsFormat.None && camera.GetComponent<DepthOnlyCameraController>() == null)
+            {
+                _log.Debug($"Adapting depth camera [{camera.name}] in [{prefab.name}]");
+                camera.gameObject.AddComponent<DepthOnlyCameraController>();
+            }
         _prefabs.Add(id, new InstantiatedPrefab(prefab, track));
     }
 

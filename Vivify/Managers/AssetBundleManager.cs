@@ -17,6 +17,9 @@ internal class AssetBundleManager : IDisposable
     private readonly Dictionary<string, Object> _assets = new();
     private readonly SiraLog _log;
     private readonly AssetBundle? _mainBundle;
+    private bool _disposed;
+    internal string[] GrabTextures { get; } = Array.Empty<string>();
+    internal AssetBundleCompatibility.GrabShader[] GrabShaders { get; } = Array.Empty<AssetBundleCompatibility.GrabShader>();
 
     [UsedImplicitly]
     private AssetBundleManager(
@@ -69,17 +72,19 @@ internal class AssetBundleManager : IDisposable
             return;
         }
 
-        if (HeckController.DebugMode)
+        CustomData levelCustomData = customBeatmapData.levelCustomData;
+        uint? assetBundleChecksum = levelCustomData.Get<CustomData>(ASSET_BUNDLE)?.Get<uint>(BUNDLE_CHECKSUM);
+        if (HeckController.DebugMode && (!assetBundleChecksum.HasValue || !AssetBundleCompatibility.HasOverride(assetBundleChecksum.Value)))
         {
             _mainBundle = AssetBundle.LoadFromFile(path);
         }
         else
         {
-            CustomData levelCustomData = customBeatmapData.levelCustomData;
-            uint? assetBundleChecksum = levelCustomData.Get<CustomData>(ASSET_BUNDLE)?.Get<uint>(BUNDLE_CHECKSUM);
             if (assetBundleChecksum != null)
             {
-                _mainBundle = AssetBundle.LoadFromFile(path, assetBundleChecksum.Value);
+                _mainBundle = AssetBundleCompatibility.LoadWithMetadata(path, assetBundleChecksum.Value, out string[] grabTextures, out var grabShaders);
+                GrabTextures = grabTextures;
+                GrabShaders = grabShaders;
             }
             else
             {
@@ -100,6 +105,10 @@ internal class AssetBundleManager : IDisposable
             _assets.Add(name, asset);
         }
 
+        // Results screens can retain the player context until application shutdown.
+        // Detach bundle camera targets before Unity's global asset teardown starts.
+        Application.quitting += Dispose;
+
         /*
          In Version 1.31.0,
          If you have any of the DLC, AssetBundle.UnloadAllAssetBundles(true) is called in
@@ -110,10 +119,15 @@ internal class AssetBundleManager : IDisposable
 
     public void Dispose()
     {
+        if (_disposed) return;
         if (_mainBundle != null)
         {
-            _mainBundle.Unload(true);
+            AssetBundleCompatibility.Unload(_mainBundle);
         }
+
+        _assets.Clear();
+        _disposed = true;
+        Application.quitting -= Dispose;
     }
 
     internal bool TryGetAsset<T>(string assetName, [NotNullWhen(true)] out T? asset)
